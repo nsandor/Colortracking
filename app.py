@@ -463,6 +463,11 @@ if st.button("Run Analysis") or auto_rerun:
 if "results" in st.session_state:
     res_df = st.session_state.results
     
+    # Validate columns to prevent KeyError from stale state
+    if "Time (s)" not in res_df.columns:
+        del st.session_state.results
+        st.rerun()
+
     # Plotting
     fig, ax = plt.subplots(figsize=(10, 6))
     res_df = res_df.sort_values("Time (s)")
