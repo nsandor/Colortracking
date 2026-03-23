@@ -26,6 +26,8 @@ if "rois" not in st.session_state:
     st.session_state.rois = {}  # {filename: [(x1, y1, x2, y2)]} (Always 1 item max)
 if "drawing_states" not in st.session_state:
     st.session_state.drawing_states = {} # {filename: json_dict}
+if "canvas_key_suffix" not in st.session_state:
+    st.session_state.canvas_key_suffix = 0 # Used to force frontend canvas remounts
 
 # --- Sidebar: File Upload & Settings ---
 st.sidebar.header("1. Upload Images")
@@ -85,12 +87,16 @@ if n_images == 0:
     st.error("No valid images found.")
     st.stop()
 
+# Set up slider session state tracking to allow for resets
+if "selected_img_name" not in st.session_state:
+    st.session_state.selected_img_name = loaded_filenames[0]
+
 # Image Scrubber
 if n_images > 1:
     selected_name = st.select_slider(
         "Select Image", 
         options=loaded_filenames, 
-        value=loaded_filenames[0],
+        key="selected_img_name",
         format_func=lambda x: f"Image {loaded_filenames.index(x)+1}: {x}"
     )
 else:
@@ -125,6 +131,16 @@ if tool_mode == "Draw ROI":
 else:
     drawing_mode = "transform"
 
+# Callback function to handle deleting ROIs BEFORE the page renders
+def clear_all_rois(first_file):
+    st.session_state.rois = {}
+    st.session_state.drawing_states = {}
+    st.session_state.canvas_init_state = None
+    st.session_state.last_selected_name = None
+    st.session_state.canvas_key_suffix += 1 # Force clear the frontend
+    if first_file:
+        st.session_state.selected_img_name = first_file
+
 # Copy ROI Buttons
 col1, col2, col3, col4 = st.columns([1, 1, 1, 2])
 with col1:
@@ -139,6 +155,7 @@ with col1:
                 if selected_name in st.session_state.drawing_states:
                     del st.session_state.drawing_states[selected_name]
                 st.session_state.last_selected_name = None 
+                st.session_state.canvas_key_suffix += 1
                 st.toast("Copied ROI.")
                 st.rerun()
             else:
@@ -158,19 +175,17 @@ with col2:
             
             # Reset canvas state
             st.session_state.last_selected_name = None
+            st.session_state.canvas_key_suffix += 1
             st.toast(f"Applied ROI to {len(loaded_filenames)} images.")
             st.rerun()
         else:
             st.warning("No ROI to apply.")
 
 with col3:
-    if st.button("Delete All ROIs", type="primary"):
-        st.session_state.rois = {}
-        st.session_state.drawing_states = {}
-        st.session_state.canvas_init_state = None
-        st.session_state.last_selected_name = None
+    # Use the callback to update the widget state cleanly
+    first_file = loaded_filenames[0] if n_images > 1 else None
+    if st.button("Delete All ROIs", type="primary", on_click=clear_all_rois, args=(first_file,)):
         st.toast("Cleared all ROIs.")
-        st.rerun()
 
 # Helper to generate Background Config
 def get_background_config(pil_img, w, h):
@@ -240,7 +255,8 @@ if inputs_changed or st.session_state.canvas_init_state is None:
     st.session_state.last_tool_mode = tool_mode
 
 # --- Render Canvas ---
-canvas_key = f"canvas_{selected_name}_{tool_mode}"
+# Incorporate the suffix into the key so we can force a remount when necessary
+canvas_key = f"canvas_{selected_name}_{tool_mode}_{st.session_state.canvas_key_suffix}"
 
 canvas_result = st_canvas(
     fill_color="rgba(0, 255, 0, 0.1)",
@@ -281,7 +297,9 @@ if canvas_result.json_data is not None:
             if len(rects) > 1:
                 new_json["objects"] = [latest_rect]
                 st.session_state.drawing_states[selected_name] = new_json
-                st.rerun() # Force visual refresh to remove old boxes
+                st.session_state.canvas_init_state = new_json # Update the frozen state
+                st.session_state.canvas_key_suffix += 1 # Force canvas frontend remount
+                st.rerun() 
                 
             left = int(latest_rect["left"] / scale_factor)
             top = int(latest_rect["top"] / scale_factor)
@@ -299,31 +317,60 @@ st.caption(f"Annotated **{annotated_count}/{n_images}** images.")
 # --- Step 3: Time Configuration ---
 st.header("3. Time Configuration")
 
-# Sync time data
+if "current_timebase" not in st.session_state:
+    st.session_state.current_timebase = "Seconds"
+
+new_timebase = st.selectbox("Global Timebase", ["Seconds", "Minutes", "Hours"])
+
+# Sync default time data
 if "time_data" not in st.session_state or len(st.session_state.time_data) != n_images:
     default_data = {
         "Filename": loaded_filenames,
-        "Time": [i * 10.0 for i in range(n_images)],
-        "Unit": ["seconds"] * n_images
+        "Time": [i * 10.0 for i in range(n_images)]
     }
     st.session_state.time_data = pd.DataFrame(default_data)
 
-edited_df = st.data_editor(st.session_state.time_data, use_container_width=True)
-st.session_state.time_data = edited_df
+# Handle Timebase Conversion dynamically within the table
+if new_timebase != st.session_state.current_timebase:
+    df = st.session_state.time_data
+    
+    # Convert existing values to Seconds first
+    if st.session_state.current_timebase == "Minutes":
+        df["Time"] *= 60.0
+    elif st.session_state.current_timebase == "Hours":
+        df["Time"] *= 3600.0
+        
+    # Convert Seconds to the new selected timebase
+    if new_timebase == "Minutes":
+        df["Time"] /= 60.0
+    elif new_timebase == "Hours":
+        df["Time"] /= 3600.0
+        
+    st.session_state.current_timebase = new_timebase
+    st.session_state.time_data = df
+    st.rerun()
+
+# Display the Data Editor with dynamic column naming
+display_df = st.session_state.time_data.copy()
+time_col_name = f"Time ({new_timebase})"
+display_df.rename(columns={"Time": time_col_name}, inplace=True)
+
+edited_df = st.data_editor(display_df, use_container_width=True)
+
+# Save user edits back to the internal state
+st.session_state.time_data["Time"] = edited_df[time_col_name]
 
 # --- Step 4: Analysis & Visualization ---
 st.header("4. Analysis & Output")
 
 # Analysis Settings
 with st.expander("Analysis & Plot Settings", expanded=True):
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3 = st.columns(3)
     with c1:
         color_space = st.radio("Color Space", ["RGB", "HSV"], horizontal=True)
     with c2:
         plot_type = st.radio("Plot Type", ["Bar Chart", "Line Chart"], horizontal=True)
     with c3:
-        output_timebase = st.selectbox("Output Timebase", ["Seconds", "Minutes", "Hours"])
-    with c4:
         show_legend = st.checkbox("Show Legend", value=True)
         show_grid = st.checkbox("Show Grid", value=True)
 
@@ -349,35 +396,17 @@ def perform_analysis():
         img_bgr = image_cache[filename]['bgr']
         img_h, img_w, _ = img_bgr.shape
         
-        # Get Time
+        # Get Time directly from the edited dataframe
         row = edited_df[edited_df["Filename"] == filename]
         if row.empty:
             continue
         row = row.iloc[0]
             
-        t_val = row["Time"]
-        u_val = row["Unit"]
-        
-        # Normalize Time to Seconds internally
-        t_sec = float(t_val)
-        if str(u_val).startswith("min"):
-            t_sec *= 60
-        elif str(u_val).startswith("h"):
-            t_sec *= 3600
-            
-        # Convert to target Output Timebase
-        if output_timebase == "Minutes":
-            plot_time = t_sec / 60.0
-        elif output_timebase == "Hours":
-            plot_time = t_sec / 3600.0
-        else:
-            plot_time = t_sec
+        t_val = float(row[time_col_name])
             
         frame_data = {
             "Filename": filename,
-            "Time": plot_time,
-            "Original Time": t_val,
-            "Unit": u_val
+            "Time": t_val
         }
         
         # Get ROI
@@ -467,7 +496,7 @@ if "results" in st.session_state:
         ax.plot(t, res_df["Val2"], color=colors[1], linestyle="--", marker='s', label=labels[1], alpha=0.8)
         ax.plot(t, res_df["Val3"], color=colors[2], linestyle="-.", marker='^', label=labels[2], alpha=0.8)
 
-    ax.set_xlabel(f"Time ({output_timebase})")
+    ax.set_xlabel(f"Time ({new_timebase})")
     ax.set_ylabel(y_label)
     ax.set_title(f"{color_space} Analysis over Time")
     
@@ -484,14 +513,15 @@ if "results" in st.session_state:
     st.header("Data Table")
     
     # Rename columns for final presentation table based on Color Space
-    display_df = res_df.copy()
-    display_df.rename(columns={
+    final_display_df = res_df.copy()
+    final_display_df.rename(columns={
+        "Time": f"Time ({new_timebase})",
         "Val1": labels[0],
         "Val2": labels[1],
         "Val3": labels[2]
     }, inplace=True)
     
-    st.dataframe(display_df, use_container_width=True)
+    st.dataframe(final_display_df, use_container_width=True)
     
-    csv = display_df.to_csv(index=False).encode('utf-8')
+    csv = final_display_df.to_csv(index=False).encode('utf-8')
     st.download_button("Download CSV", csv, "analysis.csv", "text/csv")
