@@ -16,17 +16,14 @@ st.title("Color Tracking Tool")
 st.markdown("""
 This tool allows you to track color intensity (RGB or HSV) over time across multiple images.
 1. **Upload** your images.
-2. **Select** each image and **Draw** Regions of Interest (ROIs).
-3. **Name** your ROIs (Optional).
-4. **Set Times** for each image.
-5. **Analyze** to generate plots and data.
+2. **Select** each image and **Draw** a single Region of Interest (ROI).
+3. **Set Times** for each image.
+4. **Analyze** to generate plots and data.
 """)
 
 # Initialize Session State
 if "rois" not in st.session_state:
-    st.session_state.rois = {}  # {filename: [roi1, roi2]}
-if "roi_names" not in st.session_state:
-    st.session_state.roi_names = [] # ["ROI 1", "ROI 2", ...] (Global list)
+    st.session_state.rois = {}  # {filename: [(x1, y1, x2, y2)]} (Always 1 item max)
 if "drawing_states" not in st.session_state:
     st.session_state.drawing_states = {} # {filename: json_dict}
 
@@ -41,7 +38,7 @@ uploaded_files = st.sidebar.file_uploader(
 st.sidebar.header("Settings")
 st.sidebar.info("Upload images to begin analysis.")
 
-# Caching mechanism using cache_resource to keep objects in memory (not pickled)
+# Caching mechanism using cache_resource to keep objects in memory
 @st.cache_resource(show_spinner=False)
 def load_images_resource(files_data):
     processed_images = {}
@@ -54,8 +51,8 @@ def load_images_resource(files_data):
             img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
             pil_img = Image.fromarray(img_rgb)
             processed_images[name] = {
-                'pil': pil_img, # Keep PIL object stable
-                'bgr': img_bgr, # Keep BGR for cv2 processing
+                'pil': pil_img, 
+                'bgr': img_bgr, 
                 'rgb': img_rgb
             }
     return processed_images
@@ -116,12 +113,12 @@ else:
     canvas_width = img_w
     canvas_height = img_h
 
-st.caption(f"Drawing on: {selected_name} | Size: {img_w}x{img_h}")
+st.caption(f"Drawing on: {selected_name} | Size: {img_w}x{img_h} | **Single ROI Enforced**")
 
 # Tool Selection
 col_tool, col_info = st.columns([1, 2])
 with col_tool:
-    tool_mode = st.radio("Tool Mode", ["Draw ROI", "Edit/Move ROIs"], horizontal=True)
+    tool_mode = st.radio("Tool Mode", ["Draw ROI", "Edit/Move ROI"], horizontal=True)
 
 if tool_mode == "Draw ROI":
     drawing_mode = "rect"
@@ -129,7 +126,7 @@ else:
     drawing_mode = "transform"
 
 # Copy ROI Buttons
-col1, col2, col3 = st.columns([1, 1, 3])
+col1, col2, col3, col4 = st.columns([1, 1, 1, 2])
 with col1:
     if st.button("Copy Previous"):
         curr_idx = loaded_filenames.index(selected_name)
@@ -142,10 +139,10 @@ with col1:
                 if selected_name in st.session_state.drawing_states:
                     del st.session_state.drawing_states[selected_name]
                 st.session_state.last_selected_name = None 
-                st.toast(f"Copied {len(prev_rois)} ROIs.")
+                st.toast("Copied ROI.")
                 st.rerun()
             else:
-                st.warning("No ROIs in previous.")
+                st.warning("No ROI in previous.")
         else:
             st.warning("First image.")
 
@@ -161,10 +158,19 @@ with col2:
             
             # Reset canvas state
             st.session_state.last_selected_name = None
-            st.toast(f"Applied ROIs to {len(loaded_filenames)} images.")
+            st.toast(f"Applied ROI to {len(loaded_filenames)} images.")
             st.rerun()
         else:
-            st.warning("No ROIs to apply.")
+            st.warning("No ROI to apply.")
+
+with col3:
+    if st.button("Delete All ROIs", type="primary"):
+        st.session_state.rois = {}
+        st.session_state.drawing_states = {}
+        st.session_state.canvas_init_state = None
+        st.session_state.last_selected_name = None
+        st.toast("Cleared all ROIs.")
+        st.rerun()
 
 # Helper to generate Background Config
 def get_background_config(pil_img, w, h):
@@ -181,9 +187,6 @@ def get_background_config(pil_img, w, h):
     }
 
 # --- State Management for Canvas Stability ---
-# We must ONLY update 'initial_drawing' when the image or mode changes.
-# If we update it on every drawing action, it causes a rerun loop (flickering).
-
 if "last_selected_name" not in st.session_state:
     st.session_state.last_selected_name = None
 if "last_tool_mode" not in st.session_state:
@@ -203,7 +206,7 @@ if inputs_changed or st.session_state.canvas_init_state is None:
         # Generate Fresh
         objects = []
         saved_rois = st.session_state.rois.get(selected_name, [])
-        for (x1, y1, x2, y2) in saved_rois:
+        for (x1, y1, x2, y2) in saved_rois: # Will only be max 1 item
              objects.append({
                 "type": "rect",
                 "left": x1 * scale_factor,
@@ -225,7 +228,7 @@ if inputs_changed or st.session_state.canvas_init_state is None:
         }
         st.session_state.drawing_states[selected_name] = current_state
     else:
-        # Ensure Background is present (in case of legacy state or issues)
+        # Ensure Background is present
         if not current_state.get("backgroundImage"):
             current_state["backgroundImage"] = get_background_config(pil_image, canvas_width, canvas_height)
 
@@ -237,7 +240,6 @@ if inputs_changed or st.session_state.canvas_init_state is None:
     st.session_state.last_tool_mode = tool_mode
 
 # --- Render Canvas ---
-# Use the FROZEN state. Do not pass dynamic updates here.
 canvas_key = f"canvas_{selected_name}_{tool_mode}"
 
 canvas_result = st_canvas(
@@ -258,62 +260,38 @@ canvas_result = st_canvas(
 if canvas_result.json_data is not None:
     new_json = canvas_result.json_data
     
-    # 1. Ensure Background matches current image (Fix for 'vanishing' or incorrect BG)
-    # The canvas might return a state with a missing or stale background if the client-side wasn't fully ready.
-    # We verify the 'backgroundImage' presence.
+    # 1. Ensure Background matches current image
     if not new_json.get("backgroundImage"):
          bg_config = get_background_config(pil_image, canvas_width, canvas_height)
          new_json["backgroundImage"] = bg_config
     
-    # 2. Update State Persistence
-    st.session_state.drawing_states[selected_name] = new_json
-    
-    # 3. Extract ROIs for Analysis
+    # 2. Extract ROI for Analysis and ENFORCE Single ROI visually
     current_rois_extracted = []
-    # Only look at 'objects' list. Background is essentially invisible to this logic now.
     objects_list = new_json.get("objects", [])
+    
     if objects_list:
-        df_objects = pd.json_normalize(objects_list)
-        if not df_objects.empty:
-            for _, obj in df_objects.iterrows():
-                if obj["type"] == "rect":
-                    left = int(obj["left"] / scale_factor)
-                    top = int(obj["top"] / scale_factor)
-                    width = int(obj["width"] / scale_factor)
-                    height = int(obj["height"] / scale_factor)
-                    current_rois_extracted.append((left, top, left + width, top + height))
+        # Filter for rectangles drawn by user
+        rects = [obj for obj in objects_list if obj.get("type") == "rect"]
+        
+        if rects:
+            # Enforce single ROI rule: if multiple exist, keep only the most recent one
+            latest_rect = rects[-1]
+            
+            # If the user drew a new one, strip out the older ones to update the visual state
+            if len(rects) > 1:
+                new_json["objects"] = [latest_rect]
+                st.session_state.drawing_states[selected_name] = new_json
+                st.rerun() # Force visual refresh to remove old boxes
+                
+            left = int(latest_rect["left"] / scale_factor)
+            top = int(latest_rect["top"] / scale_factor)
+            width = int(latest_rect["width"] / scale_factor)
+            height = int(latest_rect["height"] / scale_factor)
+            current_rois_extracted.append((left, top, left + width, top + height))
 
+    # 3. Update State Persistence
+    st.session_state.drawing_states[selected_name] = new_json
     st.session_state.rois[selected_name] = current_rois_extracted
-    
-    # Update Global ROI Names list logic
-    current_roi_count = len(current_rois_extracted)
-    
-    # Ensure global list is long enough
-    if len(st.session_state.roi_names) < current_roi_count:
-        for k in range(len(st.session_state.roi_names), current_roi_count):
-            st.session_state.roi_names.append(f"ROI {k+1}")
-
-# Status & Naming
-current_rois = st.session_state.rois.get(selected_name, [])
-if current_rois:
-    st.subheader("ROI Names (Global)")
-    st.info("Names are shared across all images.")
-    cols = st.columns(3)
-    
-    # Only show inputs for the number of ROIs in THIS image
-    # Note: We work on the GLOBAL list directly
-    for idx in range(len(current_rois)):
-        # Safety check if global list is shorter (shouldn't happen due to logic above)
-        if idx >= len(st.session_state.roi_names):
-             st.session_state.roi_names.append(f"ROI {idx+1}")
-             
-        col_idx = idx % 3
-        with cols[col_idx]:
-             st.session_state.roi_names[idx] = st.text_input(
-                f"Name for ROI {idx+1}", 
-                value=st.session_state.roi_names[idx],
-                key=f"roi_name_global_{idx}"
-            )
 
 annotated_count = len([k for k, v in st.session_state.rois.items() if v])
 st.caption(f"Annotated **{annotated_count}/{n_images}** images.")
@@ -323,30 +301,31 @@ st.header("3. Time Configuration")
 
 # Sync time data
 if "time_data" not in st.session_state or len(st.session_state.time_data) != n_images:
-     default_data = {
+    default_data = {
         "Filename": loaded_filenames,
         "Time": [i * 10.0 for i in range(n_images)],
         "Unit": ["seconds"] * n_images
     }
-     st.session_state.time_data = pd.DataFrame(default_data)
+    st.session_state.time_data = pd.DataFrame(default_data)
 
 edited_df = st.data_editor(st.session_state.time_data, use_container_width=True)
 st.session_state.time_data = edited_df
 
-# --- Step 4: Analysis ---
 # --- Step 4: Analysis & Visualization ---
 st.header("4. Analysis & Output")
 
 # Analysis Settings
 with st.expander("Analysis & Plot Settings", expanded=True):
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns(4)
     with c1:
         color_space = st.radio("Color Space", ["RGB", "HSV"], horizontal=True)
     with c2:
+        plot_type = st.radio("Plot Type", ["Bar Chart", "Line Chart"], horizontal=True)
+    with c3:
+        output_timebase = st.selectbox("Output Timebase", ["Seconds", "Minutes", "Hours"])
+    with c4:
         show_legend = st.checkbox("Show Legend", value=True)
         show_grid = st.checkbox("Show Grid", value=True)
-    with c3:
-        pass
 
 # Check if we need to auto-recalculate
 if "last_color_space" not in st.session_state:
@@ -379,50 +358,46 @@ def perform_analysis():
         t_val = row["Time"]
         u_val = row["Unit"]
         
-        # Normalize Time
+        # Normalize Time to Seconds internally
         t_sec = float(t_val)
         if str(u_val).startswith("min"):
             t_sec *= 60
         elif str(u_val).startswith("h"):
             t_sec *= 3600
             
+        # Convert to target Output Timebase
+        if output_timebase == "Minutes":
+            plot_time = t_sec / 60.0
+        elif output_timebase == "Hours":
+            plot_time = t_sec / 3600.0
+        else:
+            plot_time = t_sec
+            
         frame_data = {
             "Filename": filename,
-            "Time (s)": t_sec,
+            "Time": plot_time,
             "Original Time": t_val,
             "Unit": u_val
         }
         
-        # Get ROIs & Names
+        # Get ROI
         file_rois = st.session_state.rois.get(filename, [])
-        # Use Global Names
-        global_roi_names = st.session_state.roi_names
-        
-        # Ensure names match count (bulletproofing)
-        if len(global_roi_names) < len(file_rois):
-             # This really shouldn't happen if the UI logic works, but just in case
-             # we temporarily extend it for this read (not saving back to state here to avoid side effects in loop)
-             extended_names = global_roi_names + [f"ROI {k+1}" for k in range(len(global_roi_names), len(file_rois))]
-        else:
-             extended_names = global_roi_names
         
         # Convert Color Space
         if color_space == "HSV":
             img_proc = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
         else:
             img_proc = img_bgr
+            
+        val1, val2, val3 = np.nan, np.nan, np.nan
         
-        for r_idx, (x1, y1, x2, y2) in enumerate(file_rois):
+        # Process the single ROI if it exists
+        if file_rois:
+            x1, y1, x2, y2 = file_rois[0]
             x1, y1 = max(0, x1), max(0, y1)
             x2, y2 = min(img_w, x2), min(img_h, y2)
             
             region = img_proc[y1:y2, x1:x2]
-            
-            roi_name = extended_names[r_idx]
-            # Sanitize name for DataFrame column
-            safe_name = roi_name.replace(" ", "_").replace(".", "")
-            
-            val1, val2, val3 = np.nan, np.nan, np.nan
             
             if region.size > 0:
                 mean = cv2.mean(region)
@@ -430,22 +405,14 @@ def perform_analysis():
                     val3 = mean[0] / 255.0 * 100 # Blue
                     val2 = mean[1] / 255.0 * 100 # Green
                     val1 = mean[2] / 255.0 * 100 # Red
-                    
-                    frame_data[f"Val1_{safe_name}"] = val1 # Red
-                    frame_data[f"Val2_{safe_name}"] = val2 # Green
-                    frame_data[f"Val3_{safe_name}"] = val3 # Blue
                 else: # HSV
-                    h_raw = mean[0]
-                    s_raw = mean[1]
-                    v_raw = mean[2]
+                    val1 = mean[0] * 2.0  # H (0-360)
+                    val2 = mean[1] / 255.0 * 100 # S
+                    val3 = mean[2] / 255.0 * 100 # V
                     
-                    val1 = h_raw * 2.0  # H (0-360)
-                    val2 = s_raw / 255.0 * 100 # S
-                    val3 = v_raw / 255.0 * 100 # V
-                    
-                    frame_data[f"Val1_{safe_name}"] = val1 # Hue
-                    frame_data[f"Val2_{safe_name}"] = val2 # Sat
-                    frame_data[f"Val3_{safe_name}"] = val3 # Val
+        frame_data["Val1"] = val1 
+        frame_data["Val2"] = val2 
+        frame_data["Val3"] = val3 
 
         results.append(frame_data)
         progress_bar.progress((i + 1) / n_images)
@@ -454,7 +421,7 @@ def perform_analysis():
     status_text.empty()
     st.success("Analysis Complete!")
 
-if st.button("Run Analysis") or auto_rerun:
+if st.button("Run Analysis", type="primary") or auto_rerun:
     perform_analysis()
     if auto_rerun:
         st.rerun()
@@ -464,57 +431,67 @@ if "results" in st.session_state:
     res_df = st.session_state.results
     
     # Validate columns to prevent KeyError from stale state
-    if "Time (s)" not in res_df.columns:
+    if "Time" not in res_df.columns:
         del st.session_state.results
         st.rerun()
 
     # Plotting
     fig, ax = plt.subplots(figsize=(10, 6))
-    res_df = res_df.sort_values("Time (s)")
-    t = res_df["Time (s)"]
-    
-    # Determine labels based on current color space setting
-    # Note: If the user changes color space but hasn't re-run analysis, 
-    # the data might be stale.
-    # However, our auto_rerun logic attempts to fix this.
+    res_df = res_df.sort_values("Time")
+    t = res_df["Time"]
     
     if color_space == "RGB":
         labels = ["Red", "Green", "Blue"]
-        colors = ["r", "g", "b"]
-        styles = ["--", ":", "-."]
+        colors = ["#ff4b4b", "#4caf50", "#2196f3"] # Improved colors for visual clarity
         y_label = "Intensity (%)"
     else:
         labels = ["Hue", "Saturation", "Value"]
         colors = ["m", "c", "k"]
-        styles = ["-", "--", ":"]
         y_label = "Value (deg / %)"
         
-    area_cols = [c for c in res_df.columns if c.startswith("Val1_")]
-    # Extract names from columns: Val1_{Name} -> {Name}
-    roi_names_found = [c.replace("Val1_", "") for c in area_cols]
-    
-    for name in roi_names_found:
-        if f"Val1_{name}" in res_df:
-            ax.plot(t, res_df[f"Val1_{name}"], color=colors[0], linestyle=styles[0], marker='o', label=f"{labels[0]} {name}", alpha=0.7)
-        if f"Val2_{name}" in res_df:
-            ax.plot(t, res_df[f"Val2_{name}"], color=colors[1], linestyle=styles[1], marker='s', label=f"{labels[1]} {name}", alpha=0.7)
-        if f"Val3_{name}" in res_df:
-            ax.plot(t, res_df[f"Val3_{name}"], color=colors[2], linestyle=styles[2], marker='^', label=f"{labels[2]} {name}", alpha=0.7)
+    if plot_type == "Bar Chart":
+        # Grouped Bar Chart
+        x_indexes = np.arange(len(res_df))
+        width = 0.25
+        
+        ax.bar(x_indexes - width, res_df["Val1"], width, color=colors[0], label=labels[0])
+        ax.bar(x_indexes,         res_df["Val2"], width, color=colors[1], label=labels[1])
+        ax.bar(x_indexes + width, res_df["Val3"], width, color=colors[2], label=labels[2])
+        
+        # Align ticks with Time values
+        ax.set_xticks(x_indexes)
+        ax.set_xticklabels([f"{val:.1f}" for val in t], rotation=45)
+    else:
+        # Line Chart
+        ax.plot(t, res_df["Val1"], color=colors[0], linestyle="-", marker='o', label=labels[0], alpha=0.8)
+        ax.plot(t, res_df["Val2"], color=colors[1], linestyle="--", marker='s', label=labels[1], alpha=0.8)
+        ax.plot(t, res_df["Val3"], color=colors[2], linestyle="-.", marker='^', label=labels[2], alpha=0.8)
 
-    ax.set_xlabel("Time (seconds)")
+    ax.set_xlabel(f"Time ({output_timebase})")
     ax.set_ylabel(y_label)
     ax.set_title(f"{color_space} Analysis over Time")
     
     if show_grid:
-        ax.grid(True)
+        ax.grid(True, linestyle=':', alpha=0.6)
     
     if show_legend:
         ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
     
+    # Avoid overlapping elements
+    plt.tight_layout()
     st.pyplot(fig)
     
     st.header("Data Table")
-    st.dataframe(res_df)
     
-    csv = res_df.to_csv(index=False).encode('utf-8')
+    # Rename columns for final presentation table based on Color Space
+    display_df = res_df.copy()
+    display_df.rename(columns={
+        "Val1": labels[0],
+        "Val2": labels[1],
+        "Val3": labels[2]
+    }, inplace=True)
+    
+    st.dataframe(display_df, use_container_width=True)
+    
+    csv = display_df.to_csv(index=False).encode('utf-8')
     st.download_button("Download CSV", csv, "analysis.csv", "text/csv")
